@@ -25,6 +25,8 @@ import (
 	"reflect"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
+
 	"golang.org/x/net/context"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -47,7 +49,6 @@ const (
 // ClusterStatusUpdater updates the status of the FlinkCluster CR.
 type ClusterStatusUpdater struct {
 	k8sClient client.Client
-	log       logr.Logger
 	recorder  record.EventRecorder
 	observed  ObservedClusterState
 }
@@ -59,10 +60,11 @@ type Status interface {
 // Compares the current status recorded in the cluster's status field and the
 // new status derived from the status of the components, updates the cluster
 // status if it is changed, returns the new status.
-func (updater *ClusterStatusUpdater) updateStatusIfChanged(ctx context.Context) (
-	bool, error) {
+func (updater *ClusterStatusUpdater) updateStatusIfChanged(ctx context.Context) (bool, error) {
+	log := logr.FromContextOrDiscard(ctx)
+
 	if updater.observed.cluster == nil {
-		updater.log.Info("The cluster has been deleted, no status to update")
+		log.Info("The cluster has been deleted, no status to update")
 		return false, nil
 	}
 
@@ -73,14 +75,16 @@ func (updater *ClusterStatusUpdater) updateStatusIfChanged(ctx context.Context) 
 
 	// New status derived from the cluster's components.
 	var newStatus = updater.deriveClusterStatus(
-		updater.observed.cluster, &updater.observed)
+		ctx,
+		updater.observed.cluster,
+		&updater.observed)
 
 	// Compare
-	var changed = updater.isStatusChanged(oldStatus, newStatus)
+	var changed = updater.isStatusChanged(ctx, oldStatus, newStatus)
 
 	// Update
 	if changed {
-		updater.log.Info(
+		log.Info(
 			"Status changed",
 			"old",
 			updater.observed.cluster.Status,
@@ -91,7 +95,7 @@ func (updater *ClusterStatusUpdater) updateStatusIfChanged(ctx context.Context) 
 		return true, updater.updateClusterStatus(ctx, newStatus)
 	}
 
-	updater.log.Info("No status change", "state", oldStatus.State)
+	log.Info("No status change", "state", oldStatus.State)
 	return false, nil
 }
 
@@ -201,6 +205,7 @@ func (updater *ClusterStatusUpdater) createStatusChangeEvent(
 }
 
 func (updater *ClusterStatusUpdater) deriveClusterStatus(
+	ctx context.Context,
 	cluster *v1beta1.FlinkCluster,
 	observed *ObservedClusterState) v1beta1.FlinkClusterStatus {
 	var totalComponents int
@@ -510,6 +515,8 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 		v1beta1.ClusterStatePartiallyStopped:
 		if shouldUpdateCluster(observed) {
 			status.State = v1beta1.ClusterStateUpdating
+		} else if jobStatus.IsActive() {
+			status.State = v1beta1.ClusterStateRunning
 		} else if runningComponents == 0 {
 			status.State = v1beta1.ClusterStateStopped
 		} else if runningComponents < totalComponents {
@@ -529,7 +536,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 
 	// (Optional) Job.
 	// Update job status.
-	status.Components.Job = updater.deriveJobStatus()
+	status.Components.Job = updater.deriveJobStatus(ctx)
 
 	// (Optional) Savepoint.
 	// Update savepoint status if it is in progress or requested.
@@ -590,7 +597,7 @@ func (updater *ClusterStatusUpdater) getFlinkJobID() *string {
 
 	return nil
 }
-func (updater *ClusterStatusUpdater) deriveJobSubmitterExitCodeAndReason(pod *corev1.Pod) (int32, string) {
+func (updater *ClusterStatusUpdater) deriveJobSubmitterExitCodeAndReason(pod *corev1.Pod, job *batchv1.Job) (int32, string) {
 	for _, containerStatus := range pod.Status.ContainerStatuses {
 		if containerStatus.Name == jobSubmitterPodMainContainerName && containerStatus.State.Terminated != nil {
 			exitCode := containerStatus.State.Terminated.ExitCode
@@ -599,6 +606,13 @@ func (updater *ClusterStatusUpdater) deriveJobSubmitterExitCodeAndReason(pod *co
 			return exitCode, fmt.Sprintf("[Exit code: %d] Reason: %s, Message: %s", exitCode, reason, message)
 		}
 	}
+	// In some cases, the finished pod maybe collected by k8s garbage collector. In this case, we use job.Status to fill it
+	if job.Status.Succeeded == 1 {
+		return 0, "[Exit code: 0]"
+	}
+	if job.Status.Failed == 1 {
+		return 1, fmt.Sprintf("[Exit code: %d] Reason: %s", 1, "Job submitter pod is lost. Returning exit code as 1.")
+	}
 	return -1, ""
 }
 
@@ -606,7 +620,9 @@ func isNonZeroExitCode(exitCode int32) bool {
 	return exitCode != 0 && exitCode != -1
 }
 
-func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
+func (updater *ClusterStatusUpdater) deriveJobStatus(ctx context.Context) *v1beta1.JobStatus {
+	log := logr.FromContextOrDiscard(ctx)
+
 	var observed = updater.observed
 	var observedCluster = observed.cluster
 	var jobSpec = observedCluster.Spec.Job
@@ -631,7 +647,7 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
 
 	if observedSubmitter.job != nil {
 		newJob.SubmitterName = observedSubmitter.job.Name
-		exitCode, _ := updater.deriveJobSubmitterExitCodeAndReason(observed.flinkJobSubmitter.pod)
+		exitCode, _ := updater.deriveJobSubmitterExitCodeAndReason(observed.flinkJobSubmitter.pod, observed.flinkJobSubmitter.job)
 		newJob.SubmitterExitCode = exitCode
 	} else if observedSubmitter.job == nil || observed.flinkJobSubmitter.pod == nil {
 		// Submitter is nil, so the submitter exit code shouldn't be "running"
@@ -646,20 +662,40 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
 		newJobState = v1beta1.JobStatePending
 	case shouldUpdateJob(&observed):
 		newJobState = v1beta1.JobStateUpdating
-	case oldJob.ShouldRestart(jobSpec):
-		newJobState = v1beta1.JobStateRestarting
 	case oldJob.IsStopped():
-		newJobState = oldJob.State
+		// When a new job is deploying, update the job state to deploying.
+		if observedSubmitter.job != nil && (observedSubmitter.job.Status.Active == 1 || isJobInitialising(observedSubmitter.job.Status)) {
+			newJobState = v1beta1.JobStateDeploying
+		} else {
+			newJobState = oldJob.State
+		}
 	case oldJob.IsPending() && oldJob.DeployTime != "":
 		newJobState = v1beta1.JobStateDeploying
 	// Derive the job state from the observed Flink job, if it exists.
 	case observedFlinkJob != nil:
-		newJobState = getFlinkJobDeploymentState(observedFlinkJob.State)
-		newJob.ID = observedFlinkJob.Id
-		newJob.Name = observedFlinkJob.Name
+		if observedFlinkJob.Id != "" {
+			newJob.ID = observedFlinkJob.Id
+		}
+		if observedFlinkJob.Name != "" {
+			newJob.Name = observedFlinkJob.Name
+		}
+		tmpState := getFlinkJobDeploymentState(observedFlinkJob.State)
+		if observedSubmitter.job == nil ||
+			(observedSubmitter.job.Status.Failed < 1 && tmpState != v1beta1.JobStateSucceeded) {
+			newJobState = tmpState
+			break
+		}
+		log.Info("The submitter maybe still running. Waiting for it")
+		fallthrough
 	case oldJob.IsActive() && observedSubmitter.job != nil && observedSubmitter.job.Status.Active == 0:
 		if observedSubmitter.job.Status.Succeeded == 1 {
 			newJobState = v1beta1.JobStateSucceeded
+			if newJob.SubmitterExitCode == -1 {
+				log.Info("Job succeeded but the exit code is -1. This is an edge case that may " +
+					"happen if the controller is down or busy for a long time and the submitter pod is deleted externally " +
+					"including by kube-system:pod-garbage-collector. Changing exit code to 0.")
+				newJob.SubmitterExitCode = 0
+			}
 		} else if observedSubmitter.job.Status.Failed == 1 {
 			newJobState = v1beta1.JobStateFailed
 		} else {
@@ -725,8 +761,7 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
 					for _, e := range exceptions.Exceptions {
 						newJob.FailureReasons = append(newJob.FailureReasons, e.Exception)
 					}
-				}
-				if observedSubmitter.log != nil {
+				} else if observedSubmitter.log != nil {
 					newJob.FailureReasons = append(newJob.FailureReasons, observedSubmitter.log.message)
 				}
 			}
@@ -766,12 +801,15 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
 }
 
 func (updater *ClusterStatusUpdater) isStatusChanged(
+	ctx context.Context,
 	currentStatus v1beta1.FlinkClusterStatus,
 	newStatus v1beta1.FlinkClusterStatus) bool {
+	log := logr.FromContextOrDiscard(ctx)
+
 	var changed = false
 	if newStatus.State != currentStatus.State {
 		changed = true
-		updater.log.Info(
+		log.Info(
 			"Cluster state changed",
 			"current",
 			currentStatus.State,
@@ -779,7 +817,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 			newStatus.State)
 	}
 	if !reflect.DeepEqual(newStatus.Control, currentStatus.Control) {
-		updater.log.Info(
+		log.Info(
 			"Control status changed", "current",
 			currentStatus.Control,
 			"new",
@@ -787,7 +825,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 		changed = true
 	}
 	if !reflect.DeepEqual(newStatus.Components.ConfigMap, currentStatus.Components.ConfigMap) {
-		updater.log.Info(
+		log.Info(
 			"ConfigMap status changed",
 			"current",
 			currentStatus.Components.ConfigMap,
@@ -796,7 +834,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 		changed = true
 	}
 	if !reflect.DeepEqual(newStatus.Components.JobManager, currentStatus.Components.JobManager) {
-		updater.log.Info(
+		log.Info(
 			"JobManager StatefulSet status changed",
 			"current", currentStatus.Components.JobManager,
 			"new",
@@ -804,7 +842,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 		changed = true
 	}
 	if !reflect.DeepEqual(newStatus.Components.JobManagerService, currentStatus.Components.JobManagerService) {
-		updater.log.Info(
+		log.Info(
 			"JobManager service status changed",
 			"current",
 			currentStatus.Components.JobManagerService,
@@ -813,7 +851,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 	}
 	if currentStatus.Components.JobManagerIngress == nil {
 		if newStatus.Components.JobManagerIngress != nil {
-			updater.log.Info(
+			log.Info(
 				"JobManager ingress status changed",
 				"current",
 				"nil",
@@ -822,7 +860,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 		}
 	} else {
 		if newStatus.Components.JobManagerIngress.State != currentStatus.Components.JobManagerIngress.State {
-			updater.log.Info(
+			log.Info(
 				"JobManager ingress status changed",
 				"current",
 				*currentStatus.Components.JobManagerIngress,
@@ -832,7 +870,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 		}
 	}
 	if !reflect.DeepEqual(newStatus.Components.TaskManager, currentStatus.Components.TaskManager) {
-		updater.log.Info(
+		log.Info(
 			"TaskManager StatefulSet status changed",
 			"current",
 			currentStatus.Components.TaskManager,
@@ -842,7 +880,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 	}
 	if currentStatus.Components.Job == nil {
 		if newStatus.Components.Job != nil {
-			updater.log.Info(
+			log.Info(
 				"Job status changed",
 				"current",
 				"nil",
@@ -855,7 +893,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 			var isEqual = reflect.DeepEqual(
 				newStatus.Components.Job, currentStatus.Components.Job)
 			if !isEqual {
-				updater.log.Info(
+				log.Info(
 					"Job status changed",
 					"current",
 					*currentStatus.Components.Job,
@@ -868,7 +906,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 		}
 	}
 	if !reflect.DeepEqual(newStatus.Savepoint, currentStatus.Savepoint) {
-		updater.log.Info(
+		log.Info(
 			"Savepoint status changed", "current",
 			currentStatus.Savepoint,
 			"new",
@@ -881,7 +919,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 		nr.NextRevision != cr.NextRevision ||
 		(nr.CollisionCount != nil && cr.CollisionCount == nil) ||
 		(cr.CollisionCount != nil && *nr.CollisionCount != *cr.CollisionCount) {
-		updater.log.Info(
+		log.Info(
 			"FlinkCluster revision status changed", "current",
 			fmt.Sprintf("currentRevision: %v, nextRevision: %v, collisionCount: %v", cr.CurrentRevision, cr.NextRevision, cr.CollisionCount),
 			"new",

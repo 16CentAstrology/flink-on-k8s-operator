@@ -31,6 +31,7 @@ import (
 	"github.com/spotify/flink-on-k8s-operator/internal/util"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -90,6 +91,10 @@ func getDesiredClusterState(observed *ObservedClusterState) *model.DesiredCluste
 
 	if !shouldCleanup(cluster, "PodDisruptionBudget") {
 		state.PodDisruptionBudget = newPodDisruptionBudget(cluster)
+	}
+
+	if !shouldCleanup(cluster, "HorizontalPodAutoscaler") {
+		state.HorizontalPodAutoscaler = newHorizontalPodAutoscaler(cluster)
 	}
 
 	if !shouldCleanup(cluster, "JobManager") && !applicationMode {
@@ -205,6 +210,7 @@ func newJobManagerPodSpec(mainContainer *corev1.Container, flinkCluster *v1beta1
 		InitContainers:                convertContainers(jobManagerSpec.InitContainers, []corev1.VolumeMount{}, clusterSpec.EnvVars),
 		Containers:                    []corev1.Container{*mainContainer},
 		Volumes:                       jobManagerSpec.Volumes,
+		Affinity:                      jobManagerSpec.Affinity,
 		NodeSelector:                  jobManagerSpec.NodeSelector,
 		Tolerations:                   jobManagerSpec.Tolerations,
 		ImagePullSecrets:              imageSpec.PullSecrets,
@@ -451,6 +457,7 @@ func newTaskManagerPodSpec(mainContainer *corev1.Container, flinkCluster *v1beta
 		InitContainers:                convertContainers(taskManagerSpec.InitContainers, []corev1.VolumeMount{}, clusterSpec.EnvVars),
 		Containers:                    []corev1.Container{*mainContainer},
 		Volumes:                       taskManagerSpec.Volumes,
+		Affinity:                      taskManagerSpec.Affinity,
 		NodeSelector:                  taskManagerSpec.NodeSelector,
 		Tolerations:                   taskManagerSpec.Tolerations,
 		ImagePullSecrets:              imageSpec.PullSecrets,
@@ -574,15 +581,16 @@ func newPodDisruptionBudget(flinkCluster *v1beta1.FlinkCluster) *policyv1.PodDis
 		return nil
 	}
 
-	labels := getClusterLabels(flinkCluster)
+	selectorLabels := getClusterLabels(flinkCluster)
+	labels := mergeLabels(selectorLabels, getRevisionHashLabels(&flinkCluster.Status.Revision))
 	if pdbSpec.Selector == nil {
 		pdbSpec.Selector = new(metav1.LabelSelector)
 	}
 
 	if pdbSpec.Selector.MatchLabels == nil {
-		pdbSpec.Selector.MatchLabels = labels
+		pdbSpec.Selector.MatchLabels = selectorLabels
 	} else {
-		for k, v := range labels {
+		for k, v := range selectorLabels {
 			pdbSpec.Selector.MatchLabels[k] = v
 		}
 	}
@@ -598,6 +606,40 @@ func newPodDisruptionBudget(flinkCluster *v1beta1.FlinkCluster) *policyv1.PodDis
 		},
 		Spec: *pdbSpec,
 	}
+}
+
+// Gets the desired HorizontalPodAutoscaler.
+func newHorizontalPodAutoscaler(flinkCluster *v1beta1.FlinkCluster) *autoscalingv2.HorizontalPodAutoscaler {
+	hpaSpec := flinkCluster.Spec.TaskManager.HorizontalPodAutoscaler
+	if hpaSpec == nil {
+		return nil
+	}
+
+	selectorLabels := getClusterLabels(flinkCluster)
+	labels := mergeLabels(selectorLabels, getRevisionHashLabels(&flinkCluster.Status.Revision))
+
+	return &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: flinkCluster.Namespace,
+			Name:      getHorizontalPodAutoscalerName(flinkCluster.Name),
+			OwnerReferences: []metav1.OwnerReference{
+				ToOwnerReference(flinkCluster),
+			},
+			Labels: labels,
+		},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			MaxReplicas: hpaSpec.MaxReplicas,
+			MinReplicas: hpaSpec.MinReplicas,
+			Metrics:     hpaSpec.Metrics,
+			Behavior:    hpaSpec.Behavior,
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: flinkCluster.APIVersion,
+				Kind:       flinkCluster.Kind,
+				Name:       flinkCluster.Name,
+			},
+		},
+	}
+
 }
 
 // Gets the desired TaskManager Headless Service.
@@ -818,6 +860,7 @@ func newJobSubmitterPodSpec(flinkCluster *v1beta1.FlinkCluster) *corev1.PodSpec 
 		SecurityContext:    jobSpec.SecurityContext,
 		HostAliases:        jobSpec.HostAliases,
 		ServiceAccountName: getServiceAccountName(serviceAccount),
+		Affinity:           jobSpec.Affinity,
 		NodeSelector:       jobSpec.NodeSelector,
 		Tolerations:        jobSpec.Tolerations,
 	}

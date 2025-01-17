@@ -118,6 +118,11 @@ func (reconciler *ClusterReconciler) reconcile(ctx context.Context) (ctrl.Result
 		return ctrl.Result{}, err
 	}
 
+	err = reconciler.reconcileHorizontalPodAutoscaler(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	err = reconciler.reconcileTaskManagerService(ctx)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -225,6 +230,14 @@ func (reconciler *ClusterReconciler) reconcileComponent(
 	return nil
 }
 
+func (reconciler *ClusterReconciler) reconcileHorizontalPodAutoscaler(ctx context.Context) error {
+	return reconciler.reconcileComponent(
+		ctx,
+		"HorizontalPodAutoscaler",
+		reconciler.desired.HorizontalPodAutoscaler,
+		reconciler.observed.horizontalPodAutoscaler)
+}
+
 func (reconciler *ClusterReconciler) reconcileTaskManagerService(ctx context.Context) error {
 	var desiredTmService = reconciler.desired.TmService
 	var observedTmService = reconciler.observed.tmService
@@ -234,7 +247,7 @@ func (reconciler *ClusterReconciler) reconcileTaskManagerService(ctx context.Con
 		desiredTmService.SetResourceVersion(observedTmService.GetResourceVersion())
 		desiredTmService.Spec.ClusterIP = observedTmService.Spec.ClusterIP
 	}
-	return reconciler.reconcileComponent(ctx, "JobManagerService", desiredTmService, observedTmService)
+	return reconciler.reconcileComponent(ctx, "TaskManagerService", desiredTmService, observedTmService)
 }
 
 func (reconciler *ClusterReconciler) createComponent(
@@ -327,18 +340,21 @@ func (reconciler *ClusterReconciler) reconcileHAConfigMap(ctx context.Context) e
 }
 
 func (reconciler *ClusterReconciler) reconcilePodDisruptionBudget(ctx context.Context) error {
-	var desiredPodDisruptionBudget = reconciler.desired.PodDisruptionBudget
-	var observedPodDisruptionBudget = reconciler.observed.podDisruptionBudget
+	desiredPodDisruptionBudget := reconciler.desired.PodDisruptionBudget
+	observedPodDisruptionBudget := reconciler.observed.podDisruptionBudget
 
-	if desiredPodDisruptionBudget != nil && observedPodDisruptionBudget == nil {
-		return reconciler.createComponent(ctx, desiredPodDisruptionBudget, "PodDisruptionBudget")
+	if desiredPodDisruptionBudget != nil && observedPodDisruptionBudget != nil {
+		// When updating a PodDisruptionBudget, the resource version must be set!
+		// Setting the resource version to the observed resource version ensures that the update is not rejected
+		desiredPodDisruptionBudget.SetResourceVersion(observedPodDisruptionBudget.ResourceVersion)
 	}
 
-	if desiredPodDisruptionBudget == nil && observedPodDisruptionBudget != nil {
-		return reconciler.deleteComponent(ctx, observedPodDisruptionBudget, "PodDisruptionBudget")
-	}
+	return reconciler.reconcileComponent(
+		ctx,
+		"PodDisruptionBudget",
+		desiredPodDisruptionBudget,
+		observedPodDisruptionBudget)
 
-	return nil
 }
 
 func (reconciler *ClusterReconciler) reconcilePersistentVolumeClaims(ctx context.Context) error {
@@ -462,6 +478,15 @@ func (reconciler *ClusterReconciler) reconcileJob(ctx context.Context) (ctrl.Res
 				if err != nil {
 					return requeueResult, err
 				}
+			} else if observedSubmitter.Status.Failed >= 1 {
+				log.Info("Found failed job submitter")
+				err = reconciler.deleteJob(ctx, observedSubmitter)
+				if err != nil {
+					return requeueResult, err
+				}
+			} else {
+				log.Info("Found job submitter, wait for it to be active or failed")
+				return requeueResult, nil
 			}
 		} else {
 			err = reconciler.createJob(ctx, desiredJob)
@@ -477,7 +502,7 @@ func (reconciler *ClusterReconciler) reconcileJob(ctx context.Context) (ctrl.Res
 		}
 
 		// Suspend or stop job to proceed update.
-		if recorded.Revision.IsUpdateTriggered() && isJobUpdate(observed.revisions, observed.cluster) {
+		if recorded.Revision.IsUpdateTriggered() && !isScaleUpdate(observed.revisions, observed.cluster) {
 			log.Info("Preparing job update")
 			var takeSavepoint = jobSpec.TakeSavepointOnUpdate == nil || *jobSpec.TakeSavepointOnUpdate
 			var shouldSuspend = takeSavepoint && util.IsBlank(jobSpec.FromSavepoint)
@@ -551,6 +576,7 @@ func (reconciler *ClusterReconciler) createJob(ctx context.Context, job *batchv1
 	} else {
 		log.Info("Job submitter created")
 	}
+
 	return err
 }
 
@@ -698,7 +724,7 @@ func (reconciler *ClusterReconciler) canSuspendJob(ctx context.Context, jobID st
 	switch s.State {
 	case v1beta1.SavepointStateSucceeded:
 		log.Info("Successfully savepoint completed, wait until the job stops")
-		return false
+		return true
 	case v1beta1.SavepointStateInProgress:
 		log.Info("Savepoint is in progress, wait until it is completed")
 		return false
@@ -885,7 +911,7 @@ func (reconciler *ClusterReconciler) updateJobDeployStatus(ctx context.Context) 
 	var newJob = clusterClone.Status.Components.Job
 
 	// Reset running job information.
-	newJob.ID = ""
+	// newJob.ID = ""
 	newJob.StartTime = ""
 	newJob.CompletionTime = nil
 

@@ -21,6 +21,7 @@ import (
 	"os"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -28,7 +29,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/spotify/flink-on-k8s-operator/apis/flinkcluster/v1beta1"
 	"github.com/spotify/flink-on-k8s-operator/controllers/flinkcluster"
@@ -55,6 +58,7 @@ func init() {
 	v1beta1.AddToScheme(scheme)
 	networkingv1.AddToScheme(scheme)
 	policyv1.AddToScheme(scheme)
+	autoscalingv2.AddToScheme(scheme)
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -68,12 +72,20 @@ func main() {
 		WithName("FlinkCluster")
 	ctrl.SetLogger(logger)
 
+	defaultNamespaces := make(map[string]cache.Config)
+	if *watchNamespace != "" {
+		setupLog.Info("Watching custom resources in the namespace", "namespace", *watchNamespace)
+		defaultNamespaces[*watchNamespace] = cache.Config{}
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:             scheme,
-		MetricsBindAddress: *metricsAddr,
-		LeaderElection:     *enableLeaderElection,
-		Namespace:          *watchNamespace,
-		LeaderElectionID:   *leaderElectionID,
+		Scheme:         scheme,
+		Metrics:        metricsserver.Options{BindAddress: *metricsAddr},
+		LeaderElection: *enableLeaderElection,
+		Cache: cache.Options{
+			DefaultNamespaces: defaultNamespaces,
+		},
+		LeaderElectionID: *leaderElectionID,
 	})
 	if err != nil {
 		setupLog.Error(err, "Unable to start manager")
