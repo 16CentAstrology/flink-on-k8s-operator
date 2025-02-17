@@ -35,6 +35,7 @@ import (
 	v1beta1 "github.com/spotify/flink-on-k8s-operator/apis/flinkcluster/v1beta1"
 	"github.com/spotify/flink-on-k8s-operator/internal/controllers/history"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -103,6 +104,11 @@ func getConfigMapName(clusterName string) string {
 
 // Gets PodDisruptionBudgetName name
 func getPodDisruptionBudgetName(clusterName string) string {
+	return "flink-" + clusterName
+}
+
+// Get HorizontalPodAutoscaler name
+func getHorizontalPodAutoscalerName(clusterName string) string {
 	return "flink-" + clusterName
 }
 
@@ -387,6 +393,10 @@ func isComponentUpdated(component client.Object, cluster *v1beta1.FlinkCluster) 
 			jm := cluster.Spec.JobManager
 			return jm == nil || jm.Ingress == nil
 		}
+	case *autoscalingv2.HorizontalPodAutoscaler:
+		if o == nil {
+			return false
+		}
 	}
 
 	labels := component.GetLabels()
@@ -424,6 +434,10 @@ func isClusterUpdateToDate(observed *ObservedClusterState) bool {
 		components = append(components, observed.podDisruptionBudget)
 	}
 
+	if observed.cluster.Spec.TaskManager.HorizontalPodAutoscaler != nil {
+		components = append(components, observed.horizontalPodAutoscaler)
+	}
+
 	switch observed.cluster.Spec.TaskManager.DeploymentType {
 	case v1beta1.DeploymentTypeDeployment:
 		components = append(components, observed.tmDeployment)
@@ -453,16 +467,16 @@ func getUpdateState(observed *ObservedClusterState) UpdateState {
 	if observed.cluster == nil {
 		return UpdateStateNoUpdate
 	}
-	var recorded = observed.cluster.Status
-	var job = recorded.Components.Job
 
-	if !recorded.Revision.IsUpdateTriggered() {
+	clusterStatus := observed.cluster.Status
+	if !clusterStatus.Revision.IsUpdateTriggered() {
 		return UpdateStateNoUpdate
 	}
 
+	jobStatus := clusterStatus.Components.Job
 	switch {
-	case isJobUpdate(observed.revisions, observed.cluster) &&
-		!job.UpdateReady(observed.cluster.Spec.Job, observed.observeTime):
+	case !isScaleUpdate(observed.revisions, observed.cluster) &&
+		!jobStatus.UpdateReady(observed.cluster.Spec.Job, observed.observeTime):
 		return UpdateStatePreparing
 	case !isClusterUpdateToDate(observed):
 		return UpdateStateInProgress
@@ -470,38 +484,31 @@ func getUpdateState(observed *ObservedClusterState) UpdateState {
 	return UpdateStateFinished
 }
 
-func revisionDiff(a, b *appsv1.ControllerRevision) map[string]util.DiffValue {
+func revisionDiff(revisions []*appsv1.ControllerRevision) map[string]util.DiffValue {
+	if len(revisions) < 2 {
+		return map[string]util.DiffValue{}
+	}
+
 	patchSpec := func(bytes []byte) map[string]any {
 		var raw map[string]any
 		json.Unmarshal(bytes, &raw)
 		return raw["spec"].(map[string]any)
 	}
 
+	history.SortControllerRevisions(revisions)
+	a, b := revisions[len(revisions)-2], revisions[len(revisions)-1]
 	aSpec := patchSpec(a.Data.Raw)
 	bSpec := patchSpec(b.Data.Raw)
 
 	return util.MapDiff(aSpec, bSpec)
 }
 
-func isJobUpdate(revisions []*appsv1.ControllerRevision, cluster *v1beta1.FlinkCluster) bool {
-	if len(revisions) < 2 || (cluster != nil && cluster.Spec.Job == nil) {
-		return false
-	}
-
-	history.SortControllerRevisions(revisions)
-	diff := revisionDiff(revisions[len(revisions)-2], revisions[len(revisions)-1])
-	_, ok := diff["job"]
-	return ok
-}
-
 func isScaleUpdate(revisions []*appsv1.ControllerRevision, cluster *v1beta1.FlinkCluster) bool {
-	if len(revisions) < 2 || (cluster != nil && cluster.Spec.Job == nil) {
+	if cluster != nil && cluster.Spec.Job == nil {
 		return false
 	}
 
-	history.SortControllerRevisions(revisions)
-	diff := revisionDiff(revisions[len(revisions)-2], revisions[len(revisions)-1])
-
+	diff := revisionDiff(revisions)
 	tmDiff, ok := diff["taskManager"]
 	if len(diff) != 1 || !ok {
 		return false
@@ -514,16 +521,16 @@ func isScaleUpdate(revisions []*appsv1.ControllerRevision, cluster *v1beta1.Flin
 }
 
 func shouldUpdateJob(observed *ObservedClusterState) bool {
-	return observed.updateState == UpdateStateInProgress && isJobUpdate(observed.revisions, observed.cluster)
+	return observed.updateState == UpdateStateInProgress && !isScaleUpdate(observed.revisions, observed.cluster)
 }
 
 func shouldUpdateCluster(observed *ObservedClusterState) bool {
-	if isJobUpdate(observed.revisions, observed.cluster) {
-		var job = observed.cluster.Status.Components.Job
-		return !job.IsActive() && observed.updateState == UpdateStateInProgress
+	if isScaleUpdate(observed.revisions, observed.cluster) {
+		return observed.updateState == UpdateStateInProgress
 	}
 
-	return observed.updateState == UpdateStateInProgress
+	var job = observed.cluster.Status.Components.Job
+	return !job.IsActive() && observed.updateState == UpdateStateInProgress
 }
 
 func shouldRecreateOnUpdate(observed *ObservedClusterState) bool {
@@ -575,10 +582,18 @@ func wasJobCancelRequested(controlStatus *v1beta1.FlinkClusterControlStatus) boo
 }
 
 func GenJobId(cluster *v1beta1.FlinkCluster) (string, error) {
+	if cluster != nil && cluster.Status.Components.Job != nil && cluster.Status.Components.Job.ID != "" {
+		return cluster.Status.Components.Job.ID, nil
+	}
+
 	if cluster == nil || len(cluster.Status.Revision.NextRevision) == 0 {
 		return "", fmt.Errorf("error generating job id: cluster or next revision is nil")
 	}
 
 	hash := md5.Sum([]byte(cluster.Status.Revision.NextRevision))
 	return hex.EncodeToString(hash[:]), nil
+}
+
+func isJobInitialising(jobStatus batchv1.JobStatus) bool {
+	return jobStatus.Active == 0 && jobStatus.Succeeded == 0 && jobStatus.Failed == 0
 }
